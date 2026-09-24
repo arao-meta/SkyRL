@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import os
 import shutil
@@ -98,6 +100,19 @@ from skyrl.train.utils.trainer_utils import (
 from skyrl.train.utils.trajectory_logging import TrajectoryLogger, pretty_print_example
 from skyrl.train.utils.utils import ResolvedPlacementGroup, configure_ray_worker_logging
 from skyrl.train.utils.vllm_metrics_scraper import VLLMMetricsScraper
+
+
+def resolve_scheduler_total_training_steps(total_training_steps: int | None) -> int | None:
+    configured = os.environ.get("SKYRL_SCHEDULER_TOTAL_TRAINING_STEPS")
+    if configured is None:
+        return total_training_steps
+    try:
+        value = int(configured)
+    except ValueError as error:
+        raise ValueError("SKYRL_SCHEDULER_TOTAL_TRAINING_STEPS must be positive") from error
+    if value <= 0:
+        raise ValueError("SKYRL_SCHEDULER_TOTAL_TRAINING_STEPS must be positive")
+    return value
 
 
 class RayPPOTrainer:
@@ -321,13 +336,17 @@ class RayPPOTrainer:
         hf_model_save = False
         self._profiler_start()
         try:
+            # A one-prompt dataloader can exhaust an epoch while DAPO is still
+            # resampling the same logical step. Keep the callback and vLLM
+            # metrics window open across that epoch boundary; it is reset only
+            # after a real optimizer step completes below.
+            step_started = False
             for epoch in range(start_epoch, self.cfg.trainer.epochs):
                 self._current_epoch = epoch
                 self._fire("on_epoch_start")
                 # ``step_started`` tracks the on_step_start/on_step_end pairing taking
                 # dynamic-sampling into account (which span multiple inner iterations
                 # before completing a logical step).
-                step_started = False
                 for _, rand_prompts in enumerate(self.train_dataloader):
                     if not step_started:
                         self._fire("on_step_start")
@@ -435,6 +454,11 @@ class RayPPOTrainer:
                             # remove some unwanted keys
                             for key in ["rewards"]:
                                 training_input.pop(key)
+                            # Preserve the exact prompt-group identity in dumped
+                            # batches before removing the trainer-only key.
+                            training_input.metadata["audit_uids"] = list(
+                                training_input.metadata["uids"]
+                            )
                             training_input.metadata.pop("uids")
                             training_input.metadata.pop("is_last_step", None)
 
@@ -467,8 +491,10 @@ class RayPPOTrainer:
                         hf_model_save = self.cfg.trainer.hf_save_interval > 0 and (
                             is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0
                         )
+                        save_at_epoch_end = os.environ.get("SKYRL_SAVE_AT_EPOCH_END", "1") == "1"
                         ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
-                            is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
+                            (save_at_epoch_end and is_epoch_end)
+                            or self.global_step % self.cfg.trainer.ckpt_interval == 0
                         )
                         will_save_ckpts = force_save or ckpt_interval_save
                         if will_save_ckpts:
@@ -787,11 +813,14 @@ class RayPPOTrainer:
             critic_steps_per_train_batch = (
                 cfg.trainer.train_batch_size // cfg.trainer.critic_mini_batch_size * cfg.trainer.update_epochs_per_batch
             )
+        scheduler_total_steps = resolve_scheduler_total_training_steps(
+            self.total_training_steps
+        )
         policy_num_training_steps = (
-            self.total_training_steps * policy_steps_per_train_batch if self.total_training_steps is not None else None
+            scheduler_total_steps * policy_steps_per_train_batch if scheduler_total_steps is not None else None
         )
         critic_num_training_steps = (
-            self.total_training_steps * critic_steps_per_train_batch if self.total_training_steps is not None else None
+            scheduler_total_steps * critic_steps_per_train_batch if scheduler_total_steps is not None else None
         )
         if not cfg.trainer.placement.colocate_all:
             refs = []
@@ -1671,6 +1700,14 @@ class RayPPOTrainer:
 
         io.makedirs(global_step_folder, exist_ok=True)
 
+        receipt_path = os.path.join(global_step_folder, "checkpoint_complete.json")
+        if io.exists(receipt_path):
+            self._validate_checkpoint_receipt(global_step_folder)
+            self._publish_latest_checkpoint()
+            with Timer("cleanup_old_checkpoints", self.all_timings):
+                self._cleanup_old_checkpoints()
+            return global_step_folder
+
         # Save policy checkpoint (dispatch handles offload/backload)
         self.dispatch.save_checkpoint("policy", policy_save_dir, self.tokenizer)
 
@@ -1686,7 +1723,7 @@ class RayPPOTrainer:
                 torch.save(dataloader_state_dict, f)
             logger.info(f"Saved dataloader state to {dataloader_save_path}")
         except Exception as e:
-            logger.warning(f"Failed to save dataloader state: {e}")
+            raise RuntimeError(f"Failed to save dataloader state: {e}") from e
 
         # Save additional trainer state
         trainer_state = {
@@ -1698,10 +1735,27 @@ class RayPPOTrainer:
             torch.save(trainer_state, f)
         logger.info(f"Saved trainer state to {trainer_state_path}")
 
-        # Atomic tracking - write this last after all saves succeed
-        latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
-        with io.open_file(latest_checkpoint_file, "w") as f:
-            f.write(str(self.global_step))
+        # Subclasses must add their complete resume state before any public
+        # marker can expose this checkpoint.
+        self._save_additional_checkpoint_state(global_step_folder)
+        self._checkpoint_failure_hook("after_additional_state")
+
+        # Some backends finish rank-local checkpoint writes asynchronously.
+        # The transaction cannot be validated or committed until all workers
+        # acknowledge that those writes are durable.
+        self.dispatch.finalize_pending_saves("policy")
+        if self.has_critic:
+            self.dispatch.finalize_pending_saves("critic")
+        self._checkpoint_failure_hook("after_backend_finalize")
+
+        receipt = self._build_checkpoint_receipt(global_step_folder)
+        self._checkpoint_failure_hook("after_readback_validation")
+        self._write_checkpoint_receipt(receipt_path, receipt)
+        self._checkpoint_failure_hook("after_checkpoint_receipt")
+
+        # The latest pointer is strictly downstream of the verified receipt.
+        self._publish_latest_checkpoint()
+        self._checkpoint_failure_hook("after_latest_marker")
 
         logger.info(f"Successfully saved checkpoint for global_step_{self.global_step} to: {global_step_folder}")
 
@@ -1711,6 +1765,138 @@ class RayPPOTrainer:
 
         return global_step_folder
 
+    def _save_additional_checkpoint_state(self, global_step_folder: str) -> None:
+        """Hook for trainer variants whose exact resume needs extra state."""
+
+    def _checkpoint_required_state_files(self) -> tuple[str, ...]:
+        return ("data.pt", "trainer_state.pt")
+
+    def _checkpoint_failure_hook(self, phase: str) -> None:
+        requested = os.environ.get("SKYRL_CHECKPOINT_FAIL_PHASE", "").strip()
+        if requested == phase:
+            raise RuntimeError(f"injected checkpoint failure at {phase}")
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _build_checkpoint_receipt(self, global_step_folder: str) -> dict:
+        if io.is_cloud_path(global_step_folder):
+            raise ValueError("transactional training checkpoints must use local storage")
+        root = Path(global_step_folder)
+        for relative in self._checkpoint_required_state_files():
+            path = root / relative
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(f"checkpoint state is missing or empty: {path}")
+            with path.open("rb") as stream:
+                value = torch.load(stream, map_location="cpu", weights_only=False)
+            if (
+                isinstance(value, dict)
+                and "global_step" in value
+                and int(value["global_step"]) != self.global_step
+            ):
+                raise RuntimeError(f"trainer state step mismatch in {path}")
+        for model_dir in ("policy", "critic") if self.has_critic else ("policy",):
+            path = root / model_dir
+            if not path.is_dir() or not any(member.is_file() for member in path.rglob("*")):
+                raise RuntimeError(f"checkpoint model directory is empty: {path}")
+        members = []
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError(f"checkpoint contains a symlink: {path}")
+            if path.is_file() and path.name != "checkpoint_complete.json":
+                members.append(
+                    {
+                        "path": path.relative_to(root).as_posix(),
+                        "size_bytes": path.stat().st_size,
+                        "sha256": self._sha256_file(path),
+                    }
+                )
+        if not members:
+            raise RuntimeError(f"checkpoint contains no files: {root}")
+        return {
+            "schema_version": 1,
+            "status": "complete",
+            "global_step": self.global_step,
+            "members": members,
+        }
+
+    def _write_checkpoint_receipt(self, receipt_path: str, receipt: dict) -> None:
+        path = Path(receipt_path)
+        encoded = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        with path.open("rb") as stream:
+            if stream.read() != encoded:
+                raise IOError(f"checkpoint receipt read-back mismatch: {path}")
+
+    def _validate_checkpoint_receipt(self, global_step_folder: str) -> dict:
+        root = Path(global_step_folder)
+        receipt_path = root / "checkpoint_complete.json"
+        receipt = json.loads(receipt_path.read_text())
+        if (
+            receipt.get("schema_version") != 1
+            or receipt.get("status") != "complete"
+            or receipt.get("global_step") != self.global_step
+        ):
+            raise RuntimeError(f"invalid checkpoint receipt: {receipt_path}")
+        members = receipt.get("members")
+        if not isinstance(members, list) or not members:
+            raise RuntimeError(f"checkpoint receipt contains no members: {receipt_path}")
+        for member in members:
+            relative = Path(member["path"])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError(f"unsafe checkpoint member: {relative}")
+            path = root / relative
+            if (
+                not path.is_file()
+                or path.stat().st_size != member["size_bytes"]
+                or self._sha256_file(path) != member["sha256"]
+            ):
+                raise RuntimeError(f"checkpoint member does not verify: {path}")
+        expected_members = {member["path"] for member in members}
+        actual_members = {
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*")
+            if path.is_file() and path.name != "checkpoint_complete.json"
+        }
+        if actual_members != expected_members:
+            raise RuntimeError(
+                f"checkpoint member set does not match receipt: {receipt_path}"
+            )
+        return receipt
+
+    def _publish_latest_checkpoint(self) -> None:
+        latest = Path(self.cfg.trainer.ckpt_path) / "latest_ckpt_global_step.txt"
+        if io.is_cloud_path(str(latest)):
+            with io.open_file(str(latest), "w") as stream:
+                stream.write(str(self.global_step))
+            return
+        temporary = latest.with_name(f".{latest.name}.{os.getpid()}.tmp")
+        with temporary.open("w") as stream:
+            stream.write(str(self.global_step))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, latest)
+        directory = os.open(latest.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     def _cleanup_old_checkpoints(self):
         if not self._node_ids:
             self._node_ids = self.dispatch.get_node_ids()
@@ -1719,10 +1905,15 @@ class RayPPOTrainer:
             cleanup_old_checkpoints,
             self.cfg.trainer.ckpt_path,
             self.cfg.trainer.max_ckpts_to_keep,
+            require_complete_receipt=True,
         )
         # run on driver as well
         # NOTE (sumanthrh): the function will get called twice on the node with driver process, but it's ok because it's idempotent
-        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep)
+        cleanup_old_checkpoints(
+            self.cfg.trainer.ckpt_path,
+            self.cfg.trainer.max_ckpts_to_keep,
+            require_complete_receipt=True,
+        )
 
     def load_checkpoints(self) -> Tuple[int, str]:
         """
@@ -1815,11 +2006,12 @@ class RayPPOTrainer:
 
         # 3. Load policy checkpoint (dispatch handles offload/backload)
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")
+        policy_only_resume = os.environ.get("SKYRL_RESUME_POLICY_ONLY", "0") == "1"
         self.dispatch.load_checkpoint(
             "policy",
             policy_ckpt_dir,
-            load_optimizer_states=True,
-            load_lr_scheduler_states=True,
+            load_optimizer_states=not policy_only_resume,
+            load_lr_scheduler_states=not policy_only_resume,
         )
         logger.info("Successfully loaded policy checkpoint")
 
