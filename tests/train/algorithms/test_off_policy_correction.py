@@ -528,6 +528,36 @@ def test_compute_off_policy_correction_sequence_mask_zeros_loss():
     torch.testing.assert_close(new_loss_mask, expected_mask, rtol=1e-3, atol=1e-4)
     # Check that the sequence mask metrics show sequence mask happened
     assert metrics["geo_sequence_mask_masked_ratio"] == 1.0
+    assert metrics["original_loss_token_count"] == 3.0
+    assert metrics["effective_loss_token_count"] == 0.0
+    assert metrics["effective_loss_mask_fraction"] == 0.0
+    assert metrics["masked_loss_token_fraction"] == 1.0
+
+
+def test_compute_off_policy_correction_zero_input_mask_keeps_metric_schema():
+    old_log_probs = torch.tensor([[-1.0, -1.0, -1.0]])
+    rollout_logprobs = torch.tensor([[-1.0, -1.0, -1.0]])
+    loss_mask = torch.zeros_like(old_log_probs)
+    config = OffPolicyCorrectionConfig(
+        tis_ratio_type=None,
+        sequence_mask_metric="geometric",
+        geo_mask_high=2.0,
+        geo_mask_low=0.5,
+        outlier_token_is_threshold_low=None,
+        outlier_token_is_threshold_high=None,
+    )
+
+    _tis_ratio, metrics, _new_loss_mask = compute_off_policy_correction(
+        old_log_probs, rollout_logprobs, loss_mask, config
+    )
+
+    assert metrics["is_ratio_valid_min"] == 0.0
+    assert metrics["is_ratio_token_mean"] == 0.0
+    assert metrics["is_ratio_p50"] == 0.0
+    assert metrics["is_ratio_p95"] == 0.0
+    assert metrics["is_ratio_p99"] == 0.0
+    assert metrics["is_ratio_below_0_5_ratio"] == 0.0
+    assert metrics["is_ratio_above_2_ratio"] == 0.0
 
 
 def test_ppo_policy_loss_with_off_policy_correction():
@@ -774,3 +804,9 @@ def test_compute_off_policy_correction_with_token_mask():
     torch.testing.assert_close(new_loss_mask, expected_mask)
     assert "token_mask_ratio" in metrics
     assert abs(metrics["token_mask_ratio"] - 1 / 3) < 0.01
+    assert metrics["original_loss_token_count"] == 3.0
+    assert metrics["effective_loss_token_count"] == 2.0
+    assert metrics["effective_loss_mask_fraction"] == pytest.approx(2 / 3)
+    assert metrics["masked_loss_token_fraction"] == pytest.approx(1 / 3)
+    assert metrics["is_ratio_p50"] == pytest.approx(1.0)
+    assert metrics["is_ratio_p95"] > 2.0
