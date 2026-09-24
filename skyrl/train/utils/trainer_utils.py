@@ -151,7 +151,12 @@ def list_checkpoint_dirs(checkpoint_base_path: str) -> list[str]:
         return []
 
 
-def cleanup_old_checkpoints(checkpoint_base_path: str, max_checkpoints: int) -> None:
+def cleanup_old_checkpoints(
+    checkpoint_base_path: str,
+    max_checkpoints: int,
+    *,
+    require_complete_receipt: bool = False,
+) -> None:
     """
     Clean up old checkpoints, keeping only the most recent `max_checkpoints` checkpoints.
 
@@ -163,6 +168,18 @@ def cleanup_old_checkpoints(checkpoint_base_path: str, max_checkpoints: int) -> 
         return
 
     checkpoint_dirs = list_checkpoint_dirs(checkpoint_base_path)
+    if require_complete_receipt:
+        checkpoint_dirs = [
+            dirname
+            for dirname in checkpoint_dirs
+            if io.exists(
+                os.path.join(
+                    checkpoint_base_path,
+                    dirname,
+                    "checkpoint_complete.json",
+                )
+            )
+        ]
 
     if len(checkpoint_dirs) <= max_checkpoints:
         return
@@ -562,24 +579,29 @@ def handle_filter_sampling(
         if traj_uid in kept_uids_set:
             kept_traj_idxs.append(idx)
 
-    # Apply filtering to generator output
-    filtered_output = filter_generator_output(generator_output, kept_traj_idxs)
-    filtered_uids = [uids[idx] for idx in kept_traj_idxs]
-
-    if "collected_generator_output" not in collected_state:
-        collected_state.update(
-            {
-                "collected_generator_output": filtered_output,
-                "collected_uids": filtered_uids.copy(),
-                "num_prompts_in_batch": len(kept_uids),
-            }
-        )
+    # ``slice_generator_output`` rejects an empty index list. An all-uniform
+    # sample batch is a normal DAPO event, not a malformed generator output:
+    # retain any previously collected signal and ask the trainer to resample.
+    if kept_traj_idxs:
+        filtered_output = filter_generator_output(generator_output, kept_traj_idxs)
+        filtered_uids = [uids[idx] for idx in kept_traj_idxs]
+        if "collected_generator_output" not in collected_state:
+            collected_state.update(
+                {
+                    "collected_generator_output": filtered_output,
+                    "collected_uids": filtered_uids.copy(),
+                    "num_prompts_in_batch": len(kept_uids),
+                }
+            )
+        else:
+            collected_state["collected_generator_output"] = concatenate_generator_outputs(
+                [collected_state["collected_generator_output"], filtered_output]
+            )
+            collected_state["collected_uids"].extend(filtered_uids)
+            collected_state["num_prompts_in_batch"] += len(kept_uids)
     else:
-        collected_state["collected_generator_output"] = concatenate_generator_outputs(
-            [collected_state["collected_generator_output"], filtered_output]
-        )
-        collected_state["collected_uids"].extend(filtered_uids)
-        collected_state["num_prompts_in_batch"] += len(kept_uids)
+        collected_state.setdefault("collected_uids", [])
+        collected_state.setdefault("num_prompts_in_batch", 0)
 
     # Check if we have enough prompts
     if collected_state["num_prompts_in_batch"] < target_batch_size:
@@ -600,7 +622,20 @@ def handle_filter_sampling(
         final_output = collected_state["collected_generator_output"]
         final_uids = collected_state["collected_uids"]
 
-        if len(final_uids) > max_trajectories:
+        # In step-wise mode one logical trajectory can occupy several rows.  A
+        # plain ``[:max_trajectories]`` slice therefore cuts through a
+        # trajectory and corrupts the ``is_last_step`` boundaries.  Truncate at
+        # the Nth terminal row instead, retaining every selected turn belonging
+        # to the first N logical trajectories.
+        is_last_step = final_output.get("is_last_step")
+        if is_last_step is not None:
+            assert len(is_last_step) == len(final_uids)
+            terminal_rows = [idx for idx, is_last in enumerate(is_last_step) if is_last]
+            if len(terminal_rows) > max_trajectories:
+                row_limit = terminal_rows[max_trajectories - 1] + 1
+                final_output = filter_generator_output(final_output, list(range(row_limit)))
+                final_uids = final_uids[:row_limit]
+        elif len(final_uids) > max_trajectories:
             final_output = filter_generator_output(final_output, list(range(max_trajectories)))
             final_uids = final_uids[:max_trajectories]
 
