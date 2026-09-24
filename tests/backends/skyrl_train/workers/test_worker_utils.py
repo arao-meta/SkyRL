@@ -92,6 +92,33 @@ class TestReduceMetrics:
 
 
 class TestAllReduceMetrics:
+    def test_all_reduce_metrics_orders_each_collective_partition(self):
+        strategy = MagicMock()
+        observed = []
+
+        def mock_all_reduce(values, op, group=None):
+            observed.append((op, list(values)))
+            return values
+
+        strategy.all_reduce.side_effect = mock_all_reduce
+        metrics = {
+            "z_mean": 1.0,
+            "b_max": 2.0,
+            "a_max": 3.0,
+            "y_mean": 4.0,
+            "d_min": 5.0,
+            "c_min": 6.0,
+        }
+
+        all_reduce_metrics(metrics, strategy)
+
+        assert observed == [
+            ("mean", ["y_mean", "z_mean"]),
+            ("min", ["c_min", "d_min"]),
+            ("max", ["a_max", "b_max"]),
+            ("sum", []),
+        ]
+
     @pytest.mark.parametrize("sum_loss_metrics", [True, False])
     def test_all_reduce_metrics_separates_by_suffix(self, sum_loss_metrics):
         """Verify metrics are correctly separated by suffix and reduced with correct ops."""
