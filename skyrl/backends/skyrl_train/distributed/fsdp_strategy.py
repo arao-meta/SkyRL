@@ -563,6 +563,7 @@ class FSDPStrategy(DistributedStrategy):
             self.print(f"[rank-0]: Created output directory: {output_dir}")
 
         # Step 2: Extract models - get both the model for saving metadata and the FSDP model for state dict
+        language_model_only = bool(getattr(model, "language_model_only", False))
         model_to_save = self._unwrap_model(model)  # For saving config/metadata
         fsdp_model = model.model if isinstance(model, HFModelWrapper) else model  # For state dict collection
 
@@ -578,6 +579,13 @@ class FSDPStrategy(DistributedStrategy):
             with self._atomic_local_export_dir(output_dir) as work_dir:
                 # Save the model in HuggingFace format using safetensors
                 model_to_save.save_pretrained(work_dir, state_dict=output_state_dict, safe_serialization=True, **kwargs)
+
+                # A language-only PEFT model omits the enclosing multimodal
+                # ``language_model`` component from its adapter keys. Restore it
+                # in the portable HF artifact; internal checkpoints and live
+                # RDT weight sync deliberately retain their native names.
+                if language_model_only and hasattr(model_to_save, "peft_config"):
+                    self._rewrite_language_model_only_adapter(work_dir)
 
                 # Fix and save the config
                 config_to_save = self._fix_fsdp_config(model_to_save.config)
@@ -600,6 +608,38 @@ class FSDPStrategy(DistributedStrategy):
             self.print(f"[rank-0]: Successfully saved model to {output_dir}")
 
         dist.barrier()
+
+    @staticmethod
+    def _rewrite_language_model_only_adapter(work_dir: str) -> None:
+        """Insert Qwen3.8's enclosing Qwen3.5 VLM namespace in a PEFT export."""
+        from safetensors.torch import load_file, save_file
+
+        adapter_path = os.path.join(work_dir, "adapter_model.safetensors")
+        if not os.path.isfile(adapter_path):
+            raise FileNotFoundError(f"language-model-only PEFT export missing {adapter_path}")
+        old_prefix = "base_model.model.model."
+        new_prefix = "base_model.model.model.language_model."
+        state = load_file(adapter_path, device="cpu")
+        if state and all(name.startswith(new_prefix) for name in state):
+            return
+        unexpected = [name for name in state if not name.startswith(old_prefix)]
+        if not state or unexpected:
+            sample = unexpected[:5]
+            raise ValueError(
+                f"cannot safely rewrite language-model-only adapter: "
+                f"keys={len(state)}, unexpected={len(unexpected)}, sample={sample}"
+            )
+        rewritten = {
+            new_prefix + name[len(old_prefix) :]: tensor
+            for name, tensor in state.items()
+        }
+        temp_path = adapter_path + ".namespace.tmp"
+        save_file(rewritten, temp_path)
+        os.replace(temp_path, adapter_path)
+        logger.info(
+            f"Rewrote {len(rewritten)} PEFT keys for full-model reload: "
+            f"{old_prefix}* -> {new_prefix}*"
+        )
 
     @contextmanager
     def _atomic_local_export_dir(self, output_dir: str):
