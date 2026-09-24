@@ -40,9 +40,11 @@ logger = logging.getLogger(__name__)
 class Backend(Protocol):
     """How a call reaches a model. One per server process: text or tokens."""
 
+    def describe(self) -> dict[str, Any]: ...
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     async def release(self, trajectory: Trajectory) -> None: ...
+    async def finalize(self, trajectory: Trajectory) -> None: ...
     async def models(self, request: web.Request) -> web.Response: ...
     async def chat(
         self, trajectory: Trajectory, request: web.Request, chat: ChatRequest, raw: bytes
@@ -96,16 +98,24 @@ class CaptureServer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sweeper
         # Graceful shutdown: whatever is still open is written as it stands.
-        for trajectory in [t for t in self.trajectories.values() if t.is_open]:
+        for trajectory in [t for t in self.trajectories.values() if not t.ended]:
             await self._persist(trajectory)
         await self.backend.close()
 
     # -- ending a trajectory -----------------------------------------------------
     async def end(self, trajectory: Trajectory, status: Status, annotations: dict[str, Any] | None = None) -> None:
-        """Seal, release the upstream session, write, and drop from memory."""
-        if not trajectory.is_open:
+        """Seal, release the upstream session, write, and drop from memory.
+
+        A trajectory that already failed keeps its status; ``annotations`` are
+        still recorded on it.
+        """
+        if trajectory.ended:
             return
-        trajectory.seal(status, annotations)
+        if trajectory.is_open:
+            trajectory.seal(status, annotations)
+        else:
+            trajectory.annotations.update(annotations or {})
+        trajectory.ended = True
         try:
             await self.backend.release(trajectory)
         except Exception:
@@ -118,6 +128,10 @@ class CaptureServer:
         if self.record_dir is None:
             return False
         try:
+            await self.backend.finalize(trajectory)
+        except Exception:
+            logger.exception("finalizing %s failed; writing it without token text", trajectory.id)
+        try:
             await asyncio.to_thread(record.write, self.record_dir, trajectory)
         except Exception:
             logger.exception("writing %s failed", trajectory.id)
@@ -125,9 +139,9 @@ class CaptureServer:
         return True
 
     async def sweep(self) -> list[str]:
-        """Abandon open trajectories idle for longer than the TTL. Returns their ids."""
+        """End trajectories nobody finished within the TTL; open ones as abandoned. Returns their ids."""
         cutoff = time.monotonic() - self.ttl
-        idle = [t for t in self.trajectories.values() if t.is_open and not t.inflight and t.last_active < cutoff]
+        idle = [t for t in self.trajectories.values() if not t.ended and not t.inflight and t.last_active < cutoff]
         for trajectory in idle:
             logger.info("abandoning %s after %.0fs idle", trajectory.id, self.ttl)
             await self.end(trajectory, "abandoned")
@@ -153,14 +167,14 @@ class CaptureServer:
     # -- control plane --------------------------------------------------------
     async def healthz(self, request: web.Request) -> web.Response:
         open_count = sum(1 for t in self.trajectories.values() if t.is_open)
-        return _json({"ok": True, "open_trajectories": open_count})
+        return _json({"ok": True, "open_trajectories": open_count, "capture": self.backend.describe()})
 
     async def create(self, request: web.Request) -> web.Response:
         body = await _read_json(request, default={})
         meta = body.get("meta") if isinstance(body, dict) else None
         if meta is not None and not isinstance(meta, dict):
             return _json({"error": "`meta` must be an object"}, 400)
-        trajectory = Trajectory(id=new_trajectory_id(), meta=meta or {})
+        trajectory = Trajectory(id=new_trajectory_id(), meta=meta or {}, capture=self.backend.describe())
         self.trajectories[trajectory.id] = trajectory
         # The route is on the host the pool reached us at: harnesses reach it the same way.
         base = f"{request.scheme}://{request.host}"
@@ -174,7 +188,7 @@ class CaptureServer:
         trajectory = self._lookup(request.match_info["id"])
         if trajectory is None:
             return _json({"error": "unknown trajectory"}, 404)
-        if not trajectory.is_open and _changes(trajectory.annotations, annotations):
+        if trajectory.ended and _changes(trajectory.annotations, annotations):
             # A repeat is answered as the first finish was. New annotations on it would be
             # silently lost, so they are refused instead.
             return _json({"error": "trajectory already finished; its annotations can't change"}, 409)

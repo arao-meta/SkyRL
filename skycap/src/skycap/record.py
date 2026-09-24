@@ -207,11 +207,13 @@ def load(record_dir: Path, trajectory_id: str) -> Trajectory:
     trajectory = Trajectory(
         id=document["id"],
         meta=document["meta"],
+        capture=document.get("capture") or {},
         status=document["status"],
         annotations=document["annotations"],
         failures=[Failure(**failure) for failure in document["failures"]],
         created_at=document["created_at"],
         finished_at=document["finished_at"],
+        ended=True,
     )
     graph = trajectory.graph
     graph.tools.update(document["tools"])
