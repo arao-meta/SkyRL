@@ -82,6 +82,9 @@ class HFModelWrapper(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        # Preserve whether this wrapper intentionally extracted the text model.
+        # FSDP HF export uses the flag to restore the enclosing VLM namespace.
+        self.language_model_only = language_model_only
         self.temperature = temperature
         self.sequence_parallel_size = sequence_parallel_size
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
@@ -253,7 +256,7 @@ class HFModelWrapper(nn.Module):
     ) -> torch.Tensor:
         """Returns action log probs"""
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
-        if self.is_vlm:
+        if self.is_vlm and has_image_inputs:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
             # Sequence packing requires computing position IDs, but position IDs for VLMs are 3D and require
             # model specific logic to compute.
@@ -302,7 +305,7 @@ class HFModelWrapper(nn.Module):
                 sequences_rolled, None, None, self.sequence_parallel_size
             )
 
-        if self.is_vlm:
+        if self.is_vlm and has_image_inputs:
             # NOTE: transformers v5 introduced `mm_token_type_ids` to distinguish text
             # vs. multimodal tokens, and expects it to be populated at tokenization.
             # However, vLLM doesn't support transformers v5 yet so no mm_token_type_ids are
