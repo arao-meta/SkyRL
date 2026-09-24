@@ -304,12 +304,43 @@ def compute_off_policy_correction(
     if not off_policy_correction_enabled(off_policy_correction):
         return None, {}, loss_mask
 
+    original_loss_tokens = loss_mask.sum().detach()
     is_ratio = safe_exp_delta(old_log_probs - rollout_logprobs, clip=20.0, out_dtype=old_log_probs.dtype)
     metrics = {}
+    valid_is_ratio = is_ratio[loss_mask > 0].float()
     metrics["is_ratio_mean"] = masked_mean(is_ratio, loss_mask).mean().detach().item()
     metrics["is_ratio_std"] = (is_ratio * loss_mask).std().detach().item()
     metrics["is_ratio_max"] = (is_ratio * loss_mask).max().detach().item()
     metrics["is_ratio_min"] = (is_ratio * loss_mask).min().detach().item()
+    # Preserve an identical metric schema on every data-parallel rank. A rank
+    # without active tokens must still participate in the same collectives.
+    metrics.update(
+        {
+            "is_ratio_valid_min": 0.0,
+            "is_ratio_token_mean": 0.0,
+            "is_ratio_p50": 0.0,
+            "is_ratio_p95": 0.0,
+            "is_ratio_p99": 0.0,
+            "is_ratio_below_0_5_ratio": 0.0,
+            "is_ratio_above_2_ratio": 0.0,
+        }
+    )
+    if valid_is_ratio.numel() > 0:
+        quantiles = torch.quantile(
+            valid_is_ratio,
+            torch.tensor([0.50, 0.95, 0.99], device=valid_is_ratio.device),
+        )
+        metrics.update(
+            {
+                "is_ratio_valid_min": valid_is_ratio.min().detach().item(),
+                "is_ratio_token_mean": valid_is_ratio.mean().detach().item(),
+                "is_ratio_p50": quantiles[0].detach().item(),
+                "is_ratio_p95": quantiles[1].detach().item(),
+                "is_ratio_p99": quantiles[2].detach().item(),
+                "is_ratio_below_0_5_ratio": (valid_is_ratio < 0.5).float().mean().detach().item(),
+                "is_ratio_above_2_ratio": (valid_is_ratio > 2.0).float().mean().detach().item(),
+            }
+        )
 
     # Optionally apply outlier token mask if enabled
     if apply_outlier_token_mask:
@@ -344,6 +375,17 @@ def compute_off_policy_correction(
         )
         loss_mask = loss_mask * sequence_mask
         metrics.update(sequence_mask_metrics)
+
+    effective_loss_tokens = loss_mask.sum().detach()
+    denominator = original_loss_tokens.clamp_min(1)
+    metrics.update(
+        {
+            "original_loss_token_count": original_loss_tokens.item(),
+            "effective_loss_token_count": effective_loss_tokens.item(),
+            "effective_loss_mask_fraction": (effective_loss_tokens / denominator).item(),
+            "masked_loss_token_fraction": (1.0 - effective_loss_tokens / denominator).item(),
+        }
+    )
 
     return tis_ratio, metrics, loss_mask
 
