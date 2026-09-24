@@ -72,7 +72,13 @@ class DistributedStrategy(ABC):
         """Perform all_reduce across all processes (or within a process group)."""
         assert op in ("mean", "max", "sum", "min")
         if isinstance(data, dict):
-            return {k: self.all_reduce(v, op, group=group) for k, v in data.items()}
+            # All ranks must issue collectives in exactly the same order.
+            # Dictionary insertion order can differ when metrics are assembled
+            # through rank-local control flow, so it is not a safe protocol.
+            return {
+                key: self.all_reduce(data[key], op, group=group)
+                for key in sorted(data)
+            }
         else:
             is_tensor = True
             if not isinstance(data, torch.Tensor):
