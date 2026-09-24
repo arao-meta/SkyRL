@@ -715,6 +715,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # does not redo the last epoch (whose consumed UIDs were cleared at its epoch end).
             self.epoch = self.cfg.trainer.epochs
 
+        # The loop advances global_step only after committing metrics for a
+        # completed optimizer update. A final safety-net save must therefore
+        # use N, not the already-incremented N+1 label.
+        self.global_step = max(0, self.global_step - 1)
+
         # safety net: always save final checkpoint at end of training.
         if self.cfg.trainer.ckpt_interval > 0:
             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
@@ -1153,20 +1158,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         return self.convert_to_training_input(generator_output, uids)
 
-    def save_checkpoints(self) -> str:
+    def _save_additional_checkpoint_state(self, global_step_folder: str) -> None:
         """
         Extend base checkpointing by recording consumed UIDs for fully-async training.
 
         Otherwise, when resuming, there is no way to know which data has been trained on.
-        Returns the checkpoint folder path (forwarded from the base implementation).
+        This hook runs inside the base checkpoint transaction before backend
+        finalization, read-back validation, latest publication, and pruning.
         """
         consumed_uids_list = (
             self.async_train_dataloader.get_consumed_uids_list()
         )  # read first to prevent race condition
         filtered_uids_list = self.async_train_dataloader.get_filtered_uids_list()
-        # The base method will save the model, dataloader path, trainer_state, and latest_ckpt_global_step.txt.
-        global_step_folder = super().save_checkpoints()
-        # Also save the consumed UIDs (do-not-redraw this epoch), the filtered subset (so dropped
+        # Save the consumed UIDs (do-not-redraw this epoch), the filtered subset (so dropped
         # prompts are skipped, not regenerated, on resume), and the epoch (not derivable from
         # global_step under sample_full_batch, where an epoch can end early).
         fully_async_state_path = os.path.join(global_step_folder, "fully_async_state.pt")
@@ -1174,11 +1178,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "consumed_uids": consumed_uids_list,
             "filtered_uids": filtered_uids_list,
             "epoch": self.epoch,
+            "global_step": self.global_step,
         }
         with io.open_file(fully_async_state_path, "wb") as f:
             torch.save(fully_async_state, f)
         logger.info(f"Saved fully-async state to {fully_async_state_path}")
-        return global_step_folder
+
+    def _checkpoint_required_state_files(self) -> tuple[str, ...]:
+        return (*super()._checkpoint_required_state_files(), "fully_async_state.pt")
 
     def load_checkpoints(self) -> Tuple[int, str, Optional[Set[str]], Optional[Set[str]], Optional[int]]:
         """
