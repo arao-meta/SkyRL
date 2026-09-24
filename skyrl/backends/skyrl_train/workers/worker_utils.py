@@ -120,16 +120,26 @@ def all_reduce_metrics(
         sum_loss_metrics: If True, metrics named ``loss`` or ending in ``_loss`` are summed
             (for pre-scaled policy losses).
     """
-    min_metrics = {k: v for k, v in metrics.items() if k.endswith("_min")}
-    max_metrics = {k: v for k, v in metrics.items() if k.endswith("_max")}
-    sum_metrics = {
-        k: v
-        for k, v in metrics.items()
-        if sum_loss_metrics and (k == "loss" or k.endswith("_loss")) and k not in MEAN_LOSS_METRICS
-    }
-    mean_metrics = {
-        k: v for k, v in metrics.items() if k not in min_metrics and k not in max_metrics and k not in sum_metrics
-    }
+    # Recursive all-reduce issues one collective per key. Keep the order a
+    # protocol invariant instead of relying on rank-local insertion order.
+    min_metrics = dict(sorted((k, v) for k, v in metrics.items() if k.endswith("_min")))
+    max_metrics = dict(sorted((k, v) for k, v in metrics.items() if k.endswith("_max")))
+    sum_metrics = dict(
+        sorted(
+            (k, v)
+            for k, v in metrics.items()
+            if sum_loss_metrics
+            and (k == "loss" or k.endswith("_loss"))
+            and k not in MEAN_LOSS_METRICS
+        )
+    )
+    mean_metrics = dict(
+        sorted(
+            (k, v)
+            for k, v in metrics.items()
+            if k not in min_metrics and k not in max_metrics and k not in sum_metrics
+        )
+    )
     status_mean = strategy.all_reduce(mean_metrics, op="mean", group=group)
     status_min = strategy.all_reduce(min_metrics, op="min", group=group)
     status_max = strategy.all_reduce(max_metrics, op="max", group=group)
