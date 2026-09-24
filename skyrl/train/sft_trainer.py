@@ -1741,8 +1741,9 @@ class SFTTrainer:
             pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
             dp_size = total_gpus // (tp * pp)
         else:
-            # FSDP: all GPUs are data-parallel
-            dp_size = total_gpus
+            # Ulysses ranks cooperate on each sequence, so only the orthogonal
+            # mesh dimension is data parallel.
+            dp_size = total_gpus // self.sft_cfg.sequence_parallel_size
         if batch_size % dp_size != 0:
             raise ValueError(f"batch_size ({batch_size}) must be divisible by data-parallel size ({dp_size})")
         per_dp_batch = batch_size // dp_size
