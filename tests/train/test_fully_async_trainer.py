@@ -189,6 +189,40 @@ async def test_drain_next_group_blocks_until_item_arrives():
     await producer
 
 
+@pytest.mark.asyncio
+async def test_generator_worker_failure_propagates_to_consumer():
+    buffer: asyncio.Queue = asyncio.Queue()
+    done = asyncio.Event()
+    failures: list[BaseException] = []
+
+    async def fail():
+        raise RuntimeError("infrastructure-failure gate tripped: damaged_groups=8/32")
+
+    task = asyncio.create_task(fail())
+    watcher = asyncio.create_task(
+        FullyAsyncRayPPOTrainer._watch_generator_tasks([task], done, failures)
+    )
+
+    with pytest.raises(RuntimeError, match="infrastructure-failure gate tripped"):
+        await FullyAsyncRayPPOTrainer._drain_next_group(
+            object(), buffer, done, failures
+        )
+    await watcher
+
+
+@pytest.mark.asyncio
+async def test_direct_generator_failure_check_closes_full_buffer_race():
+    failures: list[BaseException] = []
+
+    async def fail():
+        raise RuntimeError("producer failed before optimizer")
+
+    task = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="producer failed before optimizer"):
+        FullyAsyncRayPPOTrainer._raise_generator_failures([task], failures)
+
+
 # --------------------------------------------------------------------------------------
 # _should_keep_group
 # --------------------------------------------------------------------------------------
