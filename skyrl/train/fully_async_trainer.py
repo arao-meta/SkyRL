@@ -905,6 +905,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         )
                     epoch_exhausted = True
                     break
+                if not self.sample_full_batch:
+                    kept_groups.append(group)
+                    buffer_pbar.update(1)
+                    buffer_pbar.set_postfix(
+                        {"buffer qsize": generation_output_group_buffer.qsize()}
+                    )
+                    continue
                 try:
                     if self._should_keep_group(group):
                         kept_groups.append(group)

@@ -5,6 +5,7 @@ UID tracking, and the consumer's exhaustion-aware buffer drain.
 """
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -241,6 +242,75 @@ def _group(rewards, loss_masks, uid="u"):
         uid=uid,
         global_step_when_scheduled=0,
     )
+
+
+def _collector(*, sample_full_batch: bool, mini_batch_size: int = 1):
+    trainer = object.__new__(FullyAsyncRayPPOTrainer)
+    trainer.sample_full_batch = sample_full_batch
+    trainer.mini_batch_size = mini_batch_size
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer._phase_gauge = SimpleNamespace(
+        timed_phase=lambda *_args, **_kwargs: nullcontext()
+    )
+    trainer._staleness_manager = SimpleNamespace(
+        on_rollout_filtered=lambda: asyncio.sleep(0)
+    )
+    trainer.async_train_dataloader = SimpleNamespace(
+        mark_filtered_uids=lambda _uids: asyncio.sleep(0)
+    )
+    trainer.cfg = SimpleNamespace(
+        trainer=SimpleNamespace(
+            algorithm=SimpleNamespace(zero_variance_filter_tol=0.0)
+        )
+    )
+    return trainer
+
+
+@pytest.mark.asyncio
+async def test_collect_without_sample_full_batch_keeps_zero_variance_group():
+    trainer = _collector(sample_full_batch=False)
+    group = _group([1.0, 1.0], [[1], [1]])
+    buffer: asyncio.Queue = asyncio.Queue()
+    buffer.put_nowait(group)
+
+    kept, dropped, exhausted = await trainer._collect_generation_mini_batch(
+        buffer, asyncio.Event(), []
+    )
+
+    assert kept == [group]
+    assert dropped == []
+    assert exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_collect_with_sample_full_batch_replaces_zero_variance_group():
+    trainer = _collector(sample_full_batch=True)
+    zero_variance = _group([1.0, 1.0], [[1], [1]], uid="drop")
+    varying = _group([1.0, 0.0], [[1], [1]], uid="keep")
+    buffer: asyncio.Queue = asyncio.Queue()
+    buffer.put_nowait(zero_variance)
+    buffer.put_nowait(varying)
+
+    kept, dropped, exhausted = await trainer._collect_generation_mini_batch(
+        buffer, asyncio.Event(), []
+    )
+
+    assert kept == [varying]
+    assert dropped == [zero_variance]
+    assert exhausted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sample_full_batch", [False, True])
+async def test_collect_propagates_producer_failure_in_both_modes(sample_full_batch):
+    trainer = _collector(sample_full_batch=sample_full_batch)
+    failure = RuntimeError("producer failed")
+
+    with pytest.raises(RuntimeError, match="producer failed"):
+        await trainer._collect_generation_mini_batch(
+            asyncio.Queue(), asyncio.Event(), [failure]
+        )
 
 
 def test_should_keep_group():
