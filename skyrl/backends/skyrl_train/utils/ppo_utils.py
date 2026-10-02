@@ -48,7 +48,11 @@ class AdaptiveKLController:
     https://arxiv.org/pdf/1909.08593.pdf
     """
 
-    def __init__(self, init_kl_coef, target, horizon, min_coef=0.0, max_coef=float("inf")):
+    def __init__(
+        self, init_kl_coef, target, horizon, min_coef=0.0, max_coef=float("inf"),
+        metric_version="policy_kl_sequence_mean_k3_v1", ema_decay=0.8,
+        warn_multiplier=1.5, pause_multiplier=2.0, consecutive_excursions=2,
+    ):
         if target <= 0 or horizon <= 0 or not 0 <= min_coef <= init_kl_coef <= max_coef:
             raise ValueError("invalid adaptive KL controller parameters")
         self.value = init_kl_coef
@@ -57,6 +61,14 @@ class AdaptiveKLController:
         self.min_coef = min_coef
         self.max_coef = max_coef
         self.update_count = 0
+        self.metric_version = metric_version
+        self.ema_decay = ema_decay
+        self.warn_multiplier = warn_multiplier
+        self.pause_multiplier = pause_multiplier
+        self.consecutive_excursions = consecutive_excursions
+        self.kl_ema = None
+        self.warn_count = 0
+        self.pause_count = 0
 
     def update(self, current, n_steps):
         if not np.isfinite(current) or n_steps <= 0:
@@ -67,6 +79,18 @@ class AdaptiveKLController:
         self.value = float(np.clip(self.value * mult, self.min_coef, self.max_coef))
         self.update_count += 1
 
+    def observe_safety(self, current):
+        if not np.isfinite(current):
+            raise ValueError(f"non-finite adaptive KL safety observation: {current}")
+        self.kl_ema = current if self.kl_ema is None else self.ema_decay * self.kl_ema + (1 - self.ema_decay) * current
+        self.warn_count = self.warn_count + 1 if self.kl_ema > self.warn_multiplier * self.target else 0
+        self.pause_count = self.pause_count + 1 if self.kl_ema > self.pause_multiplier * self.target else 0
+        return {
+            "warn": self.warn_count >= self.consecutive_excursions,
+            "pause": self.pause_count >= self.consecutive_excursions,
+            "bound_hit": self.value in (self.min_coef, self.max_coef),
+        }
+
     def state_dict(self):
         return {
             "value": self.value,
@@ -76,16 +100,28 @@ class AdaptiveKLController:
             "max_coef": self.max_coef,
             "update_count": self.update_count,
             "unit": "global_updates",
-            "metric_version": "policy_kl_sequence_mean_k3_v1",
+            "metric_version": self.metric_version,
+            "ema_decay": self.ema_decay,
+            "warn_multiplier": self.warn_multiplier,
+            "pause_multiplier": self.pause_multiplier,
+            "consecutive_excursions": self.consecutive_excursions,
+            "kl_ema": self.kl_ema,
+            "warn_count": self.warn_count,
+            "pause_count": self.pause_count,
         }
 
     def load_state_dict(self, state):
-        immutable = ("target", "horizon", "min_coef", "max_coef")
+        immutable = ("target", "horizon", "min_coef", "max_coef", "ema_decay", "warn_multiplier", "pause_multiplier", "consecutive_excursions")
         for key in immutable:
             if float(state[key]) != float(getattr(self, key)):
                 raise ValueError(f"adaptive KL checkpoint {key} differs from config")
+        if state.get("unit") != "global_updates" or state.get("metric_version") != self.metric_version:
+            raise ValueError("adaptive KL checkpoint metric identity differs from config")
         self.value = float(state["value"])
         self.update_count = int(state["update_count"])
+        self.kl_ema = state.get("kl_ema")
+        self.warn_count = int(state.get("warn_count", 0))
+        self.pause_count = int(state.get("pause_count", 0))
         if not self.min_coef <= self.value <= self.max_coef:
             raise ValueError("adaptive KL checkpoint coefficient is outside bounds")
 
@@ -134,6 +170,11 @@ def get_loss_kl_controller(algorithm_cfg: AlgorithmConfig):
         horizon=cfg.horizon_updates,
         min_coef=cfg.min_coef,
         max_coef=cfg.max_coef,
+        metric_version=f"policy_kl_{algorithm_cfg.loss_reduction}_{algorithm_cfg.kl_estimator_type}_v1",
+        ema_decay=cfg.ema_decay,
+        warn_multiplier=cfg.warn_multiplier,
+        pause_multiplier=cfg.pause_multiplier,
+        consecutive_excursions=cfg.consecutive_excursions,
     )
 
 

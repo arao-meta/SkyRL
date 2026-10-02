@@ -751,10 +751,14 @@ class LossKLCtrlConfig(BaseConfig):
     """Controller for fixed-reference KL regularization in the policy loss."""
 
     type: str = "fixed"
-    kl_target: float = 0.15
-    horizon_updates: int = 4
-    min_coef: float = 0.001
+    kl_target: float = 0.27
+    horizon_updates: int = 15
+    min_coef: float = 0.0001
     max_coef: float = 0.05
+    ema_decay: float = 0.8
+    warn_multiplier: float = 1.5
+    pause_multiplier: float = 2.0
+    consecutive_excursions: int = 2
 
 
 @dataclass

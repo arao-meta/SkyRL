@@ -100,6 +100,18 @@ def test_adaptive_kl_controller_rejects_nonfinite_observation():
         controller.update(current=float("nan"), n_steps=1)
 
 
+def test_adaptive_kl_controller_safety_state_and_metric_identity():
+    controller = AdaptiveKLController(0.001, 0.20, 15, 0.0001, 0.05)
+    assert not controller.observe_safety(0.50)["pause"]
+    assert controller.observe_safety(0.50)["pause"]
+    state = controller.state_dict()
+    incompatible = AdaptiveKLController(
+        0.001, 0.20, 15, 0.0001, 0.05, metric_version="policy_kl_sequence_mean_k1_v1"
+    )
+    with pytest.raises(ValueError, match="metric identity"):
+        incompatible.load_state_dict(state)
+
+
 @pytest.mark.parametrize("kl_estimator_type", ["k1", "k2", "k3", "abs"])
 def test_compute_approx_kl_applies_loss_mask(kl_estimator_type: str) -> None:
     """Scales kept positions; masked positions become 0.0, even when their inputs are nan/inf."""
