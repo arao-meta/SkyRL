@@ -1587,6 +1587,16 @@ class RayPPOTrainer:
                 )
                 if model == "policy" and "policy_kl" in status.metrics and not math.isfinite(float(status.metrics["policy_kl"])):
                     raise RuntimeError("non-finite policy KL detected before optimizer step")
+                if (
+                    model == "policy"
+                    and isinstance(self.loss_kl_controller, AdaptiveKLController)
+                    and self.loss_kl_controller.would_pause_before_update(float(status.metrics["policy_kl"]))
+                ):
+                    raise RuntimeError(
+                        "adaptive KL safety gate tripped before optimizer step: "
+                        f"observed={status.metrics['policy_kl']}, ema={self.loss_kl_controller.kl_ema}, "
+                        f"target={self.loss_kl_controller.target}"
+                    )
                 for k, v in status.metrics.items():
                     all_metrics[k].append(v)
 
@@ -1623,7 +1633,13 @@ class RayPPOTrainer:
             safety = (
                 self.loss_kl_controller.observe_safety(observed_kl)
                 if isinstance(self.loss_kl_controller, AdaptiveKLController)
-                else {"warn": False, "pause": False, "bound_hit": False}
+                else {
+                    "warn": False,
+                    "pause": False,
+                    "min_bound_hit": False,
+                    "max_bound_hit": False,
+                    "max_bound_unsafe": False,
+                }
             )
             policy_status.update(
                 {
@@ -1631,12 +1647,13 @@ class RayPPOTrainer:
                     "kl_loss_coef_after": float(self.loss_kl_controller.value),
                     "kl_target": float(getattr(self.loss_kl_controller, "target", observed_kl)),
                     "kl_ema": float(getattr(self.loss_kl_controller, "kl_ema", observed_kl) or observed_kl),
-                    "kl_coefficient_bound_hit": float(safety["bound_hit"]),
+                    "kl_coefficient_min_bound_hit": float(safety["min_bound_hit"]),
+                    "kl_coefficient_max_bound_hit": float(safety["max_bound_hit"]),
                 }
             )
             if safety["warn"]:
                 logger.warning("adaptive KL warning gate tripped: ema={} target={}", self.loss_kl_controller.kl_ema, self.loss_kl_controller.target)
-            if safety["pause"] or safety["bound_hit"]:
+            if safety["pause"] or safety["max_bound_unsafe"]:
                 raise RuntimeError(
                     f"adaptive KL safety gate tripped: ema={self.loss_kl_controller.kl_ema}, "
                     f"target={self.loss_kl_controller.target}, coefficient={self.loss_kl_controller.value}"

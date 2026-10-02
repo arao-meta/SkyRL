@@ -103,6 +103,7 @@ def test_adaptive_kl_controller_rejects_nonfinite_observation():
 def test_adaptive_kl_controller_safety_state_and_metric_identity():
     controller = AdaptiveKLController(0.001, 0.20, 15, 0.0001, 0.05)
     assert not controller.observe_safety(0.50)["pause"]
+    assert controller.would_pause_before_update(0.50)
     assert controller.observe_safety(0.50)["pause"]
     state = controller.state_dict()
     incompatible = AdaptiveKLController(
@@ -110,6 +111,14 @@ def test_adaptive_kl_controller_safety_state_and_metric_identity():
     )
     with pytest.raises(ValueError, match="metric identity"):
         incompatible.load_state_dict(state)
+
+
+def test_adaptive_kl_minimum_saturation_is_telemetry_only():
+    controller = AdaptiveKLController(0.0001, 0.20, 15, 0.0001, 0.05)
+    safety = controller.observe_safety(0.0)
+    assert safety["min_bound_hit"]
+    assert not safety["max_bound_unsafe"]
+    assert not safety["pause"]
 
 
 @pytest.mark.parametrize("kl_estimator_type", ["k1", "k2", "k3", "abs"])

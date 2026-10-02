@@ -88,8 +88,19 @@ class AdaptiveKLController:
         return {
             "warn": self.warn_count >= self.consecutive_excursions,
             "pause": self.pause_count >= self.consecutive_excursions,
-            "bound_hit": self.value in (self.min_coef, self.max_coef),
+            "min_bound_hit": self.value == self.min_coef,
+            "max_bound_hit": self.value == self.max_coef,
+            "max_bound_unsafe": self.value == self.max_coef and self.kl_ema > self.target,
         }
+
+    def would_pause_before_update(self, current):
+        if not np.isfinite(current):
+            return True
+        predicted_ema = current if self.kl_ema is None else self.ema_decay * self.kl_ema + (1 - self.ema_decay) * current
+        return (
+            self.pause_count >= self.consecutive_excursions - 1
+            and predicted_ema > self.pause_multiplier * self.target
+        )
 
     def state_dict(self):
         return {
