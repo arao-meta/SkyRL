@@ -48,16 +48,46 @@ class AdaptiveKLController:
     https://arxiv.org/pdf/1909.08593.pdf
     """
 
-    def __init__(self, init_kl_coef, target, horizon):
+    def __init__(self, init_kl_coef, target, horizon, min_coef=0.0, max_coef=float("inf")):
+        if target <= 0 or horizon <= 0 or not 0 <= min_coef <= init_kl_coef <= max_coef:
+            raise ValueError("invalid adaptive KL controller parameters")
         self.value = init_kl_coef
         self.target = target
         self.horizon = horizon
+        self.min_coef = min_coef
+        self.max_coef = max_coef
+        self.update_count = 0
 
     def update(self, current, n_steps):
+        if not np.isfinite(current) or n_steps <= 0:
+            raise ValueError(f"invalid adaptive KL observation: current={current}, n_steps={n_steps}")
         target = self.target
         proportional_error = np.clip(current / target - 1, -0.2, 0.2)
         mult = 1 + proportional_error * n_steps / self.horizon
-        self.value *= mult
+        self.value = float(np.clip(self.value * mult, self.min_coef, self.max_coef))
+        self.update_count += 1
+
+    def state_dict(self):
+        return {
+            "value": self.value,
+            "target": self.target,
+            "horizon": self.horizon,
+            "min_coef": self.min_coef,
+            "max_coef": self.max_coef,
+            "update_count": self.update_count,
+            "unit": "global_updates",
+            "metric_version": "policy_kl_sequence_mean_k3_v1",
+        }
+
+    def load_state_dict(self, state):
+        immutable = ("target", "horizon", "min_coef", "max_coef")
+        for key in immutable:
+            if float(state[key]) != float(getattr(self, key)):
+                raise ValueError(f"adaptive KL checkpoint {key} differs from config")
+        self.value = float(state["value"])
+        self.update_count = int(state["update_count"])
+        if not self.min_coef <= self.value <= self.max_coef:
+            raise ValueError("adaptive KL checkpoint coefficient is outside bounds")
 
 
 class FixedKLController:
@@ -68,6 +98,13 @@ class FixedKLController:
 
     def update(self, current, n_steps):
         pass
+
+    def state_dict(self):
+        return {"value": self.value, "type": "fixed"}
+
+    def load_state_dict(self, state):
+        if float(state["value"]) != float(self.value):
+            raise ValueError("fixed KL checkpoint coefficient differs from config")
 
 
 def get_kl_controller(algorithm_cfg: AlgorithmConfig):
@@ -83,6 +120,21 @@ def get_kl_controller(algorithm_cfg: AlgorithmConfig):
         )
     else:
         raise ValueError(f"Invalid KL controller type: {algorithm_cfg.kl_ctrl.type}")
+
+
+def get_loss_kl_controller(algorithm_cfg: AlgorithmConfig):
+    cfg = algorithm_cfg.loss_kl_ctrl
+    if cfg.type == "fixed":
+        return FixedKLController(algorithm_cfg.kl_loss_coef)
+    if cfg.type != "adaptive":
+        raise ValueError(f"Invalid loss KL controller type: {cfg.type}")
+    return AdaptiveKLController(
+        init_kl_coef=algorithm_cfg.kl_loss_coef,
+        target=cfg.kl_target,
+        horizon=cfg.horizon_updates,
+        min_coef=cfg.min_coef,
+        max_coef=cfg.max_coef,
+    )
 
 
 def compute_approx_kl(

@@ -747,6 +747,17 @@ class KLCtrlConfig(BaseConfig):
 
 
 @dataclass
+class LossKLCtrlConfig(BaseConfig):
+    """Controller for fixed-reference KL regularization in the policy loss."""
+
+    type: str = "fixed"
+    kl_target: float = 0.15
+    horizon_updates: int = 4
+    min_coef: float = 0.001
+    max_coef: float = 0.05
+
+
+@dataclass
 class SAPOConfig(BaseConfig):
     """SAPO parameters (https://arxiv.org/pdf/2511.20347). Only used when ``policy_loss_type="sapo"``."""
 
@@ -873,6 +884,9 @@ class AlgorithmConfig(BaseConfig):
     kl_ctrl: KLCtrlConfig = field(default_factory=KLCtrlConfig)
     """Only used when ``use_kl_in_reward=True`` (not applied when ``use_kl_loss=True``).
     Uses ``kl_loss_coef`` as the initial KL coefficient."""
+    loss_kl_ctrl: LossKLCtrlConfig = field(default_factory=LossKLCtrlConfig)
+    """Controller for ``use_kl_loss``. ``fixed`` preserves historical behavior;
+    ``adaptive`` updates once per completed optimizer step."""
     kl_estimator_type: str = "k3"
     """``"k1"``, ``"k2"``, ``"k3"``, ``"abs"``. See http://joschu.net/blog/kl-approx.html."""
     use_kl_in_reward: bool = False

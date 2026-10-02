@@ -75,6 +75,31 @@ def test_compute_approx_kl(dummy_data):
     assert torch.allclose(kl_k3, expected_k3, atol=1e-4), "k3 estimator is not correct"
 
 
+def test_adaptive_kl_controller_is_bounded_and_round_trips_state():
+    controller = AdaptiveKLController(
+        init_kl_coef=0.001,
+        target=0.15,
+        horizon=4,
+        min_coef=0.001,
+        max_coef=0.05,
+    )
+    controller.update(current=0.0, n_steps=1)
+    assert controller.value == 0.001
+    controller.update(current=0.30, n_steps=1)
+    assert controller.value == pytest.approx(0.00105)
+    assert controller.update_count == 2
+
+    restored = AdaptiveKLController(0.001, 0.15, 4, 0.001, 0.05)
+    restored.load_state_dict(controller.state_dict())
+    assert restored.state_dict() == controller.state_dict()
+
+
+def test_adaptive_kl_controller_rejects_nonfinite_observation():
+    controller = AdaptiveKLController(0.001, 0.15, 4, 0.001, 0.05)
+    with pytest.raises(ValueError, match="invalid adaptive KL observation"):
+        controller.update(current=float("nan"), n_steps=1)
+
+
 @pytest.mark.parametrize("kl_estimator_type", ["k1", "k2", "k3", "abs"])
 def test_compute_approx_kl_applies_loss_mask(kl_estimator_type: str) -> None:
     """Scales kept positions; masked positions become 0.0, even when their inputs are nan/inf."""

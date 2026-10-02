@@ -46,6 +46,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     apply_loss_reduction_to_advantages_minibatch,
     compute_approx_kl,
     get_kl_controller,
+    get_loss_kl_controller,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
@@ -170,6 +171,11 @@ class RayPPOTrainer:
         self.dynamic_sampling_state: Optional[DynamicSamplingState] = None
 
         self.reward_kl_controller: Optional[Union[FixedKLController, AdaptiveKLController]] = None
+        self.loss_kl_controller: Optional[Union[FixedKLController, AdaptiveKLController]] = (
+            get_loss_kl_controller(cfg.trainer.algorithm)
+            if cfg.trainer.algorithm.use_kl_loss
+            else None
+        )
         self.dispatch: WorkerDispatch = None
 
         self._callback_handler = CallbackHandler(callbacks)
@@ -1573,7 +1579,12 @@ class RayPPOTrainer:
         # Training loop over epochs and mini-batches
         for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
             for chunk_refs in all_chunk_refs:
-                status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
+                loss_fn_config = None
+                if model == "policy" and self.loss_kl_controller is not None:
+                    loss_fn_config = {"kl_loss_coef": self.loss_kl_controller.value}
+                status = self.dispatch.forward_backward_from_staged(
+                    model, chunk_refs, loss_fn_config=loss_fn_config
+                )
                 for k, v in status.metrics.items():
                     all_metrics[k].append(v)
 
@@ -1602,6 +1613,18 @@ class RayPPOTrainer:
                 critic_status = self._execute_training_step("critic", data)
         with Timer("policy_train", self.all_timings):
             policy_status = self._execute_training_step("policy", data)
+
+        if self.loss_kl_controller is not None:
+            observed_kl = float(policy_status["policy_kl"])
+            coefficient_before = float(self.loss_kl_controller.value)
+            self.loss_kl_controller.update(observed_kl, n_steps=1)
+            policy_status.update(
+                {
+                    "kl_loss_coef_before": coefficient_before,
+                    "kl_loss_coef_after": float(self.loss_kl_controller.value),
+                    "kl_target": float(getattr(self.loss_kl_controller, "target", observed_kl)),
+                }
+            )
 
         # Update metrics
         if critic_status is not None:
@@ -1730,6 +1753,8 @@ class RayPPOTrainer:
             "global_step": self.global_step,
             "config": asdict(self.cfg),
         }
+        if self.loss_kl_controller is not None:
+            trainer_state["loss_kl_controller"] = self.loss_kl_controller.state_dict()
         trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
         with io.open_file(trainer_state_path, "wb") as f:
             torch.save(trainer_state, f)
@@ -1986,6 +2011,13 @@ class RayPPOTrainer:
         with io.open_file(trainer_state_path, "rb") as f:
             trainer_state = torch.load(f, map_location="cpu", weights_only=False)
         saved_global_step = trainer_state.get("global_step", global_step)
+        if self.loss_kl_controller is not None:
+            controller_state = trainer_state.get("loss_kl_controller")
+            if controller_state is None:
+                if self.cfg.trainer.algorithm.loss_kl_ctrl.type == "adaptive":
+                    raise ValueError("adaptive loss KL controller state is missing from checkpoint")
+            else:
+                self.loss_kl_controller.load_state_dict(controller_state)
         logger.info("Successfully loaded trainer state")
         if saved_global_step != global_step:
             logger.warning(f"Global step mismatch: path={global_step}, saved={saved_global_step}. Using path value.")

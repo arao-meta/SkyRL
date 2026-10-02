@@ -1120,23 +1120,23 @@ class PolicyWorkerBase(Worker):
                 entropy_BS = entropy_BS[:, -num_actions - 1 : -1]
                 entropy = masked_mean(entropy_BS, loss_mask)
 
-            if self.cfg.algorithm.use_entropy_loss:
-                entropy_loss_term = entropy * self.cfg.algorithm.entropy_loss_coef
+            if loss_config.use_entropy_loss:
+                entropy_loss_term = entropy * loss_config.entropy_loss_coef
             else:
                 entropy_loss_term = torch.tensor(0.0)
 
             # kl loss
-            if self.cfg.algorithm.use_kl_loss:
+            if loss_config.use_kl_loss:
                 kl_loss = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,
                     loss_mask=loss_mask,
-                    kl_estimator_type=self.cfg.algorithm.kl_estimator_type,
+                    kl_estimator_type=loss_config.kl_estimator_type,
                 )
                 kl_loss = masked_mean(kl_loss, loss_mask, dim=-1).mean()
             else:
                 kl_loss = torch.tensor(0.0)
-            kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef
+            kl_loss_term = kl_loss * loss_config.kl_loss_coef
 
             # DP all-reduce averages gradients, but policy losses are pre-scaled sums
             # (see `apply_loss_reduction_to_advantages_minibatch`), so we multiply by
@@ -1179,7 +1179,7 @@ class PolicyWorkerBase(Worker):
             }
             for k, v in loss_metrics.items():
                 status["loss_metrics/" + k] = v
-            if self.cfg.algorithm.use_kl_loss:
+            if loss_config.use_kl_loss:
                 status["policy_kl"] = kl_loss.item()
             status.update(
                 compute_minibatch_rollout_logprob_diff_metrics(action_log_probs, rollout_action_logprobs, loss_mask)
