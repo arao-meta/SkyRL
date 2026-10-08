@@ -208,6 +208,8 @@ class OptimizerConfig(BaseConfig):
     and the extra CPU memory usage."""
     num_warmup_steps: int = 0
     """Number of mini-batch steps to warmup the optimizer."""
+    warmup_start_ratio: float = 0.0
+    """Initial warmup rate as a fraction of the configured peak learning rate."""
     scheduler: str = "constant_with_warmup"
     """Learning rate scheduler. Intended to align with ``transformers.SchedulerType``:
     https://huggingface.co/docs/transformers/main/en/main_classes/optimizer_schedules#transformers.SchedulerType"""

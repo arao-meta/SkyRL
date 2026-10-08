@@ -273,6 +273,12 @@ class FSDPStrategy(DistributedStrategy):
                 num_warmup_steps=optim_config.num_warmup_steps,
                 num_training_steps=self.total_training_steps,
             )
+            if optim_config.warmup_start_ratio:
+                from rl.integrations.skyrl.nonzero_warmup import with_nonzero_warmup
+                lr_scheduler = with_nonzero_warmup(
+                    lr_scheduler, warmup_steps=optim_config.num_warmup_steps,
+                    start_ratio=optim_config.warmup_start_ratio,
+                )
         else:
             new_optimizer = None
             lr_scheduler = None
