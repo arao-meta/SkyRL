@@ -28,6 +28,9 @@ from packaging import version
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 
+from skyrl.backends.skyrl_train.distributed.ulysses.linear_attention import (
+    patch_linear_attention_for_ulysses,
+)
 from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
@@ -131,7 +134,8 @@ def apply_monkey_patch(
     use_fused_kernels: bool = False,
     use_parent_class: bool = False,
 ):
-    """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
+    """Replace _flash_attention_forward to _ulysses_flash_attention_forward and make
+    Gated DeltaNet layers head-parallel under sequence parallelism."""
     if use_parent_class:
         parent_cls = type(model).__bases__[0]
         logger.info(f"Applying monkey patch to {parent_cls.__name__} in {parent_cls.__module__}")
@@ -160,6 +164,9 @@ def apply_monkey_patch(
 
             flash_attention._flash_attention_forward = _ulysses_flash_attention_forward
             logger.info(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
+    # Stateful sequence mixers (Gated DeltaNet) need their own head-parallel
+    # treatment; unsupported ones raise instead of training on wrong logprobs.
+    patch_linear_attention_for_ulysses(model, ulysses_sp_size)
 
 
 @lru_cache
