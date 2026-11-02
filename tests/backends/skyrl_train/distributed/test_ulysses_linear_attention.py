@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from transformers import DynamicCache
 
 qwen3_5 = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
@@ -29,8 +30,8 @@ from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
 SEQ_LEN = 96  # not a multiple of the 64-token delta-rule chunk
 
 
-def _layer() -> torch.nn.Module:
-    config = Qwen3_5TextConfig(
+def _config() -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
         hidden_size=48,
         num_hidden_layers=1,
         layer_types=["linear_attention"],
@@ -45,8 +46,11 @@ def _layer() -> torch.nn.Module:
         intermediate_size=64,
         vocab_size=64,
     )
+
+
+def _layer() -> torch.nn.Module:
     torch.manual_seed(0)
-    layer = qwen3_5.Qwen3_5GatedDeltaNet(config, layer_idx=0)
+    layer = qwen3_5.Qwen3_5GatedDeltaNet(_config(), layer_idx=0)
     with torch.no_grad():
         for parameter in layer.parameters():
             parameter.add_(0.1 * torch.randn_like(parameter))
@@ -90,7 +94,12 @@ def _worker(rank: int, world_size: int, port: int, results: dict) -> None:
             grad = parameter.grad.clone()
             dist.all_reduce(grad)  # FSDP/DDP sum gradient contributions across SP ranks
             grad_errors[name] = ((grad - ref_parameter.grad).abs().max() / ref_parameter.grad.abs().max()).item()
+        # HF models pass a fresh cache on every forward when use_cache is true
+        # (the default), including training forwards; it must not bypass the fix.
+        with torch.no_grad():
+            cached = layer(hidden[:, local], cache_params=DynamicCache(config=_config()))
         results[rank] = {
+            "cached_error": (cached - ref_out[:, local]).abs().max().item(),
             "bug_error": bug_error,
             "out_error": (out - ref_out[:, local]).abs().max().item(),
             "out_scale": ref_out.abs().max().item(),
@@ -109,6 +118,7 @@ def test_gated_deltanet_ulysses_matches_unsharded(world_size):
     for rank in range(world_size):
         result = results[rank]
         assert result["out_error"] < 1e-5 * result["out_scale"], result
+        assert result["cached_error"] < 1e-5 * result["out_scale"], result
         assert result["input_grad_error"] < 1e-5, result
         assert max(result["grad_errors"].values()) < 1e-4, result
     # Without the patch every shard after the first starts from zero state.

@@ -69,9 +69,18 @@ def _ulysses_gated_deltanet_forward(
     **kwargs,
 ):
     sp_size = get_ulysses_sequence_parallel_world_size()
-    if sp_size == 1 or cache_params is not None:
+    if sp_size == 1:
         return self._skyrl_original_forward(
             hidden_states, cache_params=cache_params, attention_mask=attention_mask, **kwargs
+        )
+    # HF models build a cache on every forward when ``config.use_cache`` is
+    # true (the default), including training forwards. A cache without
+    # previous state is a full-sequence pass: run the head-parallel path and
+    # leave the linear-attention cache unpopulated. Incremental decoding from
+    # a populated cache is not a sequence-parallel use case.
+    if cache_params is not None and cache_params.has_previous_state(self.layer_idx, state_idx=0):
+        raise UnsupportedSequenceParallelModule(
+            "cached incremental decoding is not supported for Gated DeltaNet under Ulysses sequence parallelism"
         )
     if kwargs.get("cu_seq_lens_q") is not None:
         raise UnsupportedSequenceParallelModule(
