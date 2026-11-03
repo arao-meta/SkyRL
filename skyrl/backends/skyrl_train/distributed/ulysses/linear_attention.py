@@ -16,10 +16,17 @@ rank's heads, and all-to-all the result back before the per-token gated norm
 and output projection.
 
 Supported: transformers ``Qwen3_5GatedDeltaNet``-style modules (separate
-``in_proj_qkv`` / ``in_proj_z`` / ``in_proj_b`` / ``in_proj_a``). Any other
-linear-attention module under sequence parallelism fails closed.
+``in_proj_qkv`` / ``in_proj_z`` / ``in_proj_b`` / ``in_proj_a``). Other
+stateful sequence mixers -- detected by class name or by a ``cache_params``
+forward argument, which HF uses for recurrent/convolutional state -- fail
+closed under sequence parallelism.
+
+Packing several sequences into one row is a separate hazard at any SP size:
+without per-sequence boundaries these layers carry state from one sequence
+into the next. ``check_packed_rows_supported`` lets the model wrapper refuse it.
 """
 
+import inspect
 import sys
 from typing import Any
 
@@ -82,10 +89,11 @@ def _ulysses_gated_deltanet_forward(
         raise UnsupportedSequenceParallelModule(
             "cached incremental decoding is not supported for Gated DeltaNet under Ulysses sequence parallelism"
         )
-    if kwargs.get("cu_seq_lens_q") is not None:
-        raise UnsupportedSequenceParallelModule(
-            "cu_seq_lens_q is not supported for Gated DeltaNet under Ulysses sequence parallelism"
-        )
+    for name in ("cu_seq_lens_q", "seq_idx"):
+        if kwargs.get(name) is not None:
+            raise UnsupportedSequenceParallelModule(
+                f"{name} is not supported for Gated DeltaNet under Ulysses sequence parallelism"
+            )
     kernels = sys.modules[type(self).__module__]
     hidden_states = kernels.apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, local_len, _ = hidden_states.shape
@@ -176,7 +184,34 @@ def _ulysses_gated_deltanet_forward(
 
 def _is_stateful_mixer(module: torch.nn.Module) -> bool:
     name = type(module).__name__
-    return any(marker in name for marker in _STATEFUL_MIXER_MARKERS)
+    if any(marker in name for marker in _STATEFUL_MIXER_MARKERS):
+        return True
+    # HF passes recurrent/convolutional state as ``cache_params`` (Mamba,
+    # Bamba, FalconH1, LFM2 short conv, ...); attention uses ``past_key_values``.
+    try:
+        return "cache_params" in inspect.signature(type(module).forward).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def has_stateful_mixers(model: torch.nn.Module) -> bool:
+    """Whether ``model`` contains a layer that carries state along the sequence."""
+    return any(_is_stateful_mixer(module) for module in model.modules())
+
+
+def check_packed_rows_supported(model_has_stateful_mixers: bool, sequences_per_row: int) -> None:
+    """Refuse packed rows that hold several sequences for stateful-mixer models.
+
+    Packed rows give attention its boundaries through position_ids, but
+    Gated DeltaNet / conv layers receive no per-sequence boundaries here, so
+    state leaks from one sequence into the next (at any SP size).
+    """
+    if model_has_stateful_mixers and sequences_per_row > 1:
+        raise UnsupportedSequenceParallelModule(
+            f"remove_microbatch_padding packs {sequences_per_row} sequences into one row, but the model has "
+            "linear-attention/recurrent layers that would carry state across sequences; use a micro batch "
+            "size of 1 per GPU or disable remove_microbatch_padding"
+        )
 
 
 def patch_linear_attention_for_ulysses(model: torch.nn.Module, ulysses_sp_size: int) -> int:

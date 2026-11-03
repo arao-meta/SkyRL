@@ -22,6 +22,10 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
+from skyrl.backends.skyrl_train.distributed.ulysses.linear_attention import (
+    check_packed_rows_supported,
+    has_stateful_mixers,
+)
 from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
     gather_outputs_and_unpad,
     ulysses_pad_and_slice_inputs,
@@ -274,6 +278,11 @@ class HFModelWrapper(nn.Module):
 
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
+
+        if self.remove_microbatch_padding:
+            if getattr(self, "_has_stateful_mixers", None) is None:
+                self._has_stateful_mixers = has_stateful_mixers(self.model)
+            check_packed_rows_supported(self._has_stateful_mixers, attention_mask.shape[0])
 
         sequences_fwd = sequences
         position_ids_fwd = position_ids
